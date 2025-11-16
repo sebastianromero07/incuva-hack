@@ -1,12 +1,10 @@
-fastapi[all]
-uvicorn[standard]
+fastapi
+uvicorn
 python-dotenv
 requests
-sentence-transformers
-faiss-cpu
-python-jose[cryptography]
+tinydb
 python-multipart
 jinja2
+python-jose[cryptography]
 passlib[bcrypt]
 PyPDF2
-tinydb

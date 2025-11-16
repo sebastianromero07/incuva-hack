@@ -7,14 +7,16 @@ rag = RAGSystem()
 rag.load_database()  # Cargar si ya existe
 
 def get_welcome_message() -> str:
-    """Mensaje de bienvenida fijo y amigable"""
-    return """👋 ¡Hola soy TOmi! Tu asistente virtual de soporte técnico.
+    """Mensaje de bienvenida del bot"""
+    from dashboard.routes import get_bot_config
+    bot_config = get_bot_config()
+    return bot_config.get("welcome_message", """👋 ¡Hola soy TOmi! Tu asistente virtual de soporte técnico.
 Estoy aquí para ayudarte con cualquier duda o problema que tengas.
 
-Cuéntame qué necesitas y te ayudaré al instante."""
+Cuéntame qué necesitas y te ayudaré al instante.""")
 
 def generate_reply(user_text: str) -> str:
-    """Genera respuesta usando Groq + RAG"""
+    """Genera respuesta usando Groq + RAG simple"""
     
     print(f"🤖 Procesando: '{user_text[:50]}...'")
     
@@ -22,7 +24,7 @@ def generate_reply(user_text: str) -> str:
     context = ""
     context_info = ""
     
-    if rag.index is not None:
+    if rag.chunks:
         similar_chunks = rag.search_similar(user_text, k=3)
         if similar_chunks:
             context = "\n\nContexto técnico:\n" + "\n".join(similar_chunks[:2])
@@ -89,7 +91,6 @@ def generate_reply(user_text: str) -> str:
     
     return "🤖 No pude procesar tu consulta. ¿Podrías reformularla de otra manera?"
 
-
 def setup_rag(pdf_folder: str = "data/pdfs"):
     """Función para configurar RAG - ejecutar una vez"""
     global rag
@@ -99,4 +100,4 @@ def setup_rag(pdf_folder: str = "data/pdfs"):
     else:
         print(f"⚠️ No se encontraron PDFs en {pdf_folder}")
 
-print("🚀 Sistema usando Groq API + RAG")
+print("🚀 Sistema usando Groq API + RAG Simple (sin sentence-transformers)")
