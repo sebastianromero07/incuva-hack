@@ -16,49 +16,24 @@ Estoy aquí para ayudarte con cualquier duda o problema que tengas.
 Cuéntame qué necesitas y te ayudaré al instante.""")
 
 def generate_reply(user_text: str) -> str:
-    """Genera respuesta usando Groq + RAG simple"""
+    """Genera respuesta rápida usando Groq + RAG simple"""
     
     print(f"🤖 Procesando: '{user_text[:50]}...'")
     
-    # Buscar en documentos técnicos
+    # Buscar contexto MÁS RÁPIDO (solo 2 chunks)
     context = ""
-    context_info = ""
-    
     if rag.chunks:
-        similar_chunks = rag.search_similar(user_text, k=3)
+        similar_chunks = rag.search_similar(user_text, k=2)  # Reducir de 3 a 2
         if similar_chunks:
-            context = "\n\nContexto técnico:\n" + "\n".join(similar_chunks[:2])
-            context_info = f"📚 Contexto: {len(similar_chunks)} chunks de {len(rag.list_documents())} documentos"
-            print(context_info)
+            context = "\n\nContexto: " + similar_chunks[0][:200]  # Solo primer chunk, truncado
     
     api_key = os.getenv("GROQ_API_KEY")
-    
     if not api_key:
-        return "❌ Error de configuración. Contacta al administrador."
+        return "❌ Error de configuración."
     
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
-    # Prompt mejorado
-    documents = rag.list_documents()
-    doc_info = f"\n\nTienes acceso a estos documentos: {', '.join(documents)}" if documents else ""
-    
-    system_prompt = f"""Eres TOmi, un asistente virtual de soporte técnico amigable y eficiente.
-    
-    PERSONALIDAD:
-    - Eres amigable, profesional y servicial
-    - Hablas en español de manera natural y cercana
-    - Siempre intentas ser útil y resolver problemas
-    
-    INSTRUCCIONES:
-    - Si tienes contexto técnico específico, úsalo para dar respuestas detalladas y precisas
-    - Si no tienes información específica, ofrece ayuda general pero útil
-    - Mantén las respuestas claras y bien estructuradas
-    - Usa emojis ocasionalmente para ser más amigable (pero sin exagerar)
-    - Si la consulta es muy específica y no tienes información, sugiere alternativas o contactar soporte especializado{doc_info}"""
+    # Prompt MÁS CORTO para respuesta rápida
+    system_prompt = """Eres TOmi, asistente de soporte técnico. 
+    Responde de forma concisa y útil en español. Máximo 3 párrafos."""
     
     user_message = user_text + context
     
@@ -68,29 +43,34 @@ def generate_reply(user_text: str) -> str:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
         ],
-        "temperature": 0.4,
-        "max_tokens": 400
+        "temperature": 0.3,    # Más determinístico = más rápido
+        "max_tokens": 150      # Respuestas más cortas = más rápidas
     }
     
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=8  # Timeout más corto
+        )
         
         if response.status_code == 200:
             data = response.json()
             if "choices" in data and len(data["choices"]) > 0:
                 reply = data["choices"][0]["message"]["content"].strip()
-                print(f"✅ Respuesta generada: {len(reply)} caracteres")
+                print(f"✅ Respuesta: {len(reply)} chars")
                 return reply
-        else:
-            print(f"❌ Groq error: {response.status_code}")
-            return "Disculpa, tengo problemas técnicos en este momento 😅. Inténtalo de nuevo en unos momentos."
+        
+        return "Tengo problemas técnicos 😅 Inténtalo nuevamente."
             
     except Exception as e:
-        print(f"❌ Exception: {e}")
-        return "Parece que hay un problema de conectividad 🔌. Inténtalo nuevamente por favor."
+        print(f"❌ Error: {e}")
+        return "Error de conectividad 🔌 Inténtalo de nuevo."
     
-    return "🤖 No pude procesar tu consulta. ¿Podrías reformularla de otra manera?"
-
 def setup_rag(pdf_folder: str = "data/pdfs"):
     """Función para configurar RAG - ejecutar una vez"""
     global rag
