@@ -1,232 +1,481 @@
 import os
-import json
+import PyPDF2
 import pickle
-from typing import List, Dict, Optional
-from PyPDF2 import PdfReader
-import io
+import requests
+import numpy as np
+import re
+import time
 
-class RAGSystem:
-    def __init__(self, db_path: str = "faiss_db"):
-        self.db_path = db_path
-        self.documents = {}
+
+
+# Document Intelligence (mejor que Computer Vision)
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.core.credentials import AzureKeyCredential
+
+class RAGSystemOpenAI:
+    def __init__(self, db_file="data/vector_database.pkl"):
         self.chunks = []
-        self.chunk_to_doc = {}
+        self.embeddings = []
+        self.documents = {}
+        self.db_file = db_file
+        self.openai_api_key = os.getenv("OPENAI_API_KEY")
         
-        # Crear directorio si no existe
-        os.makedirs(db_path, exist_ok=True)
-    
-    def _split_text(self, text: str, chunk_size: int = 500) -> List[str]:
-        """Dividir texto en chunks por palabras"""
-        words = text.split()
+        # Azure Document Intelligence (mejor que Computer Vision)
+        self.azure_endpoint = os.getenv("AZURE_DOC_INTELLIGENCE_ENDPOINT")
+        self.azure_key = os.getenv("AZURE_DOC_INTELLIGENCE_KEY")
+        
+        if self.azure_endpoint and self.azure_key:
+            try:
+                self.azure_client = DocumentIntelligenceClient(
+                    endpoint=self.azure_endpoint,
+                    credential=AzureKeyCredential(self.azure_key)
+                )
+                print("✅ Azure Document Intelligence configurado")
+            except Exception as e:
+                print(f"❌ Error configurando Azure: {e}")
+                self.azure_client = None
+        else:
+            self.azure_client = None
+            print("⚠️ Azure no configurado - usando PyPDF2")
+
+    def extract_text_from_pdf_azure(self, pdf_path: str) -> str:
+        """Document Intelligence - chunking semántico automático"""
+        filename = os.path.basename(pdf_path)
+        
+        if not self.azure_client:
+            return self.extract_text_from_pdf_basic(pdf_path)
+        
+        try:
+            print(f"🔍 Analizando {filename} con Document Intelligence...")
+            
+            with open(pdf_path, "rb") as f:
+                pdf_bytes = f.read()
+            
+            # Document Intelligence con layout analysis
+            poller = self.azure_client.begin_analyze_document(
+                "prebuilt-layout",  # Modelo que entiende estructura del documento
+                pdf_bytes,
+                content_type="application/pdf"
+            )
+            
+            result = poller.result()
+            
+            # Extraer texto RESPETANDO la estructura del documento
+            structured_text = ""
+            
+            if result.paragraphs:
+                # Si Document Intelligence detectó párrafos, usarlos
+                print(f"   📄 {len(result.paragraphs)} párrafos detectados")
+                for paragraph in result.paragraphs:
+                    if paragraph.content and len(paragraph.content.strip()) > 20:
+                        structured_text += paragraph.content.strip() + "\n\n"
+            
+            elif result.pages:
+                # Fallback: extraer por páginas manteniendo estructura
+                for page in result.pages:
+                    if hasattr(page, 'lines') and page.lines:
+                        page_text = []
+                        for line in page.lines:
+                            page_text.append(line.content)
+                        
+                        if page_text:
+                            structured_text += "\n".join(page_text) + "\n\n"
+            
+            if len(structured_text.strip()) > 50:
+                print(f"✅ Document Intelligence exitoso: {len(structured_text)} chars")
+                return structured_text.strip()
+            else:
+                print("⚠️ Document Intelligence insuficiente, usando PyPDF2...")
+                return self.extract_text_from_pdf_basic(pdf_path)
+                
+        except Exception as e:
+            print(f"❌ Error Document Intelligence: {e}")
+            return self.extract_text_from_pdf_basic(pdf_path)
+
+    def extract_text_from_pdf_basic(self, pdf_path: str) -> str:
+        """PyPDF2 fallback básico"""
+        filename = os.path.basename(pdf_path)
+        
+        try:
+            print(f"📄 Extrayendo con PyPDF2: {filename}...")
+            text = ""
+            
+            with open(pdf_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                
+                for page_num, page in enumerate(pdf_reader.pages):
+                    try:
+                        page_text = page.extract_text()
+                        if page_text and len(page_text.strip()) > 10:
+                            text += page_text + "\n\n"
+                    except Exception as e:
+                        print(f"   ⚠️ Error página {page_num + 1}: {e}")
+                        continue
+            
+            if len(text.strip()) > 50:
+                print(f"✅ PyPDF2 exitoso: {len(text)} chars")
+                return text.strip()
+            else:
+                print(f"❌ PyPDF2 insuficiente: {len(text)} chars")
+                return ""
+                
+        except Exception as e:
+            print(f"❌ Error PyPDF2: {e}")
+            return ""
+
+    def extract_text_from_pdf(self, pdf_path: str) -> str:
+        """Método principal"""
+        return self.extract_text_from_pdf_azure(pdf_path)
+
+    def split_text_semantic_universal(self, text: str) -> list:
+        """Chunking UNIVERSAL sin reglas hardcodeadas"""
+        if not text or len(text.strip()) < 50:
+            return []
+        
+        print("🧠 Aplicando chunking semántico universal...")
+        
+        # Limpiar texto preservando estructura
+        cleaned_text = re.sub(r'\s+', ' ', text).strip()
+        
+        # ESTRATEGIA UNIVERSAL: Párrafos naturales del documento
+        # Document Intelligence ya nos da párrafos bien estructurados
+        
+        paragraphs = []
+        
+        # Dividir por párrafos dobles (estructura natural)
+        raw_paragraphs = re.split(r'\n\s*\n', cleaned_text)
+        
+        for para in raw_paragraphs:
+            para = para.strip()
+            if len(para) > 30:  # Filtrar párrafos muy cortos
+                paragraphs.append(para)
+        
+        # Si no hay suficientes párrafos, dividir por oraciones
+        if len(paragraphs) < 2:
+            sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', cleaned_text)
+            paragraphs = [s.strip() for s in sentences if len(s.strip()) > 30]
+        
+        print(f"📝 {len(paragraphs)} segmentos detectados")
+        
+        # Crear chunks respetando límites semánticos
         chunks = []
+        current_chunk = ""
+        optimal_size = 500  # Tamaño óptimo para text-embedding-3-large
+        max_size = 800      # Máximo antes de forzar corte
         
-        for i in range(0, len(words), chunk_size):
-            chunk = " ".join(words[i:i + chunk_size])
-            if chunk.strip():
-                chunks.append(chunk.strip())
+        for paragraph in paragraphs:
+            potential_size = len(current_chunk) + len(paragraph) + 1
+            
+            if potential_size <= optimal_size or len(current_chunk) < 100:
+                # Agregar párrafo al chunk actual
+                if current_chunk:
+                    current_chunk += " " + paragraph
+                else:
+                    current_chunk = paragraph
+            else:
+                # Guardar chunk actual e iniciar nuevo
+                if current_chunk and len(current_chunk) > 80:
+                    chunks.append(current_chunk.strip())
+                current_chunk = paragraph
+            
+            # Forzar corte si se vuelve muy largo
+            if len(current_chunk) > max_size:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+        
+        # Agregar último chunk
+        if current_chunk and len(current_chunk.strip()) > 80:
+            chunks.append(current_chunk.strip())
+        
+        print(f"✅ {len(chunks)} chunks semánticos creados")
+        
+        # Preview limpio
+        for i, chunk in enumerate(chunks[:3]):
+            preview = chunk[:150] + "..." if len(chunk) > 150 else chunk
+            print(f"   📝 Chunk {i+1}: {preview}")
         
         return chunks
-    
-    def _simple_search(self, query: str, chunks: List[str], k: int = 3) -> List[str]:
-        """Búsqueda simple basada en palabras clave con mejor scoring"""
-        query_words = set(query.lower().split())
-        
-        # Palabras de parada en español
-        stop_words = {"el", "la", "de", "que", "y", "en", "un", "es", "se", "no", "te", "lo", "le", "da", "su", "por", "son", "con", "para", "como", "al", "del", "si", "me", "mi", "tu", "este", "esta", "hay", "pero", "más", "o", "muy", "ya", "todo", "bien", "puede", "ser", "tiene", "hacer", "vez", "dos", "aquí", "cómo", "qué", "dónde", "cuándo"}
-        
-        # Filtrar palabras de parada
-        query_words = query_words - stop_words
-        
-        if not query_words:
-            return []
-        
-        # Calcular puntuaciones mejoradas
-        scores = []
-        for i, chunk in enumerate(chunks):
-            chunk_words = set(chunk.lower().split()) - stop_words
-            
-            # Calcular diferentes tipos de coincidencias
-            exact_matches = len(query_words.intersection(chunk_words))
-            partial_matches = sum(1 for qw in query_words for cw in chunk_words if qw in cw or cw in qw)
-            
-            # Puntuación combinada
-            exact_score = exact_matches / max(len(query_words), 1)
-            partial_score = partial_matches / max(len(query_words), 1) * 0.3
-            total_score = exact_score + partial_score
-            
-            if total_score > 0:
-                scores.append((total_score, i, chunk))
-        
-        # Ordenar por puntuación y devolver top k
-        scores.sort(key=lambda x: x[0], reverse=True)
-        
-        # Solo devolver chunks con puntuación mínima
-        min_score = 0.1  # Umbral mínimo de relevancia
-        return [chunk for score, idx, chunk in scores[:k] if score >= min_score]
-        
-    def add_pdf_from_upload(self, file_content: bytes, filename: str) -> bool:
-        """Agregar PDF desde upload"""
+
+    def get_embedding(self, text: str) -> list:
+        """Embeddings con text-embedding-3-large"""
         try:
-            # Leer PDF
-            pdf_reader = PdfReader(io.BytesIO(file_content))
-            text_content = ""
+            cleaned_text = re.sub(r'\s+', ' ', text.strip())
             
-            for page in pdf_reader.pages:
-                text_content += page.extract_text() + "\n"
+            # text-embedding-3-large maneja más tokens
+            if len(cleaned_text) > 8000:
+                cleaned_text = cleaned_text[:8000] + "..."
             
-            if not text_content.strip():
-                print(f"❌ No se pudo extraer texto de {filename}")
-                return False
+            url = "https://api.openai.com/v1/embeddings"
+            headers = {
+                "Authorization": f"Bearer {self.openai_api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "text-embedding-3-large",  # Modelo más potente
+                "input": cleaned_text,
+                "encoding_format": "float"
+            }
             
-            # Dividir en chunks
-            chunks = self._split_text(text_content, chunk_size=500)
+            response = requests.post(url, headers=headers, json=payload, timeout=20)
             
-            # Guardar chunks
-            start_idx = len(self.chunks)
-            self.chunks.extend(chunks)
-            
-            # Mapear documento a chunks
-            chunk_indices = list(range(start_idx, len(self.chunks)))
-            self.documents[filename] = chunk_indices
-            
-            # Mapear chunks a documento
-            for idx in chunk_indices:
-                self.chunk_to_doc[idx] = filename
-            
-            # Guardar en disco
-            self.save_database()
-            
-            print(f"✅ {filename}: {len(chunks)} chunks agregados")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Error procesando {filename}: {e}")
-            return False
-    
-    def search_similar(self, query: str, k: int = 3) -> List[str]:
-        """Buscar chunks similares usando búsqueda simple"""
-        if not self.chunks:
-            return []
-        
-        return self._simple_search(query, self.chunks, k)
-    
-    def delete_document(self, filename: str) -> bool:
-        """Eliminar documento"""
-        try:
-            if filename not in self.documents:
-                return False
-            
-            # Obtener índices de chunks del documento
-            doc_chunks = self.documents[filename]
-            
-            # Crear nuevas listas sin los chunks del documento
-            new_chunks = []
-            new_chunk_to_doc = {}
-            new_documents = {}
-            
-            # Reindexar todos los chunks excepto los del documento eliminado
-            new_idx = 0
-            for old_idx, chunk in enumerate(self.chunks):
-                if old_idx not in doc_chunks:
-                    new_chunks.append(chunk)
-                    doc_name = self.chunk_to_doc.get(old_idx)
-                    if doc_name and doc_name != filename:
-                        new_chunk_to_doc[new_idx] = doc_name
-                        
-                        # Actualizar mapeo de documentos
-                        if doc_name not in new_documents:
-                            new_documents[doc_name] = []
-                        new_documents[doc_name].append(new_idx)
-                    
-                    new_idx += 1
-            
-            # Actualizar estructuras
-            self.chunks = new_chunks
-            self.chunk_to_doc = new_chunk_to_doc
-            self.documents = new_documents
-            
-            # Guardar cambios
-            self.save_database()
-            
-            print(f"✅ Documento {filename} eliminado")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Error eliminando {filename}: {e}")
-            return False
-    
-    def list_documents(self) -> List[str]:
-        """Listar documentos cargados"""
-        return list(self.documents.keys())
-    
-    def get_stats(self) -> Dict:
-        """Obtener estadísticas"""
-        return {
-            "pdf_count": len(self.documents),
-            "chunks_count": len(self.chunks),
-            "rag_status": len(self.chunks) > 0
-        }
-    
-    def save_database(self):
-        """Guardar base de datos"""
-        try:
-            # Guardar chunks
-            with open(os.path.join(self.db_path, "chunks.pkl"), "wb") as f:
-                pickle.dump(self.chunks, f)
-            
-            # Guardar mapeos
-            with open(os.path.join(self.db_path, "documents.json"), "w") as f:
-                json.dump({
-                    "documents": self.documents,
-                    "chunk_to_doc": self.chunk_to_doc
-                }, f, indent=2)
-            
-            print("💾 Base de datos guardada")
-            
-        except Exception as e:
-            print(f"❌ Error guardando BD: {e}")
-    
-    def load_database(self):
-        """Cargar base de datos existente"""
-        try:
-            chunks_file = os.path.join(self.db_path, "chunks.pkl")
-            docs_file = os.path.join(self.db_path, "documents.json")
-            
-            if os.path.exists(chunks_file) and os.path.exists(docs_file):
-                # Cargar chunks
-                with open(chunks_file, "rb") as f:
-                    self.chunks = pickle.load(f)
+            if response.status_code == 200:
+                data = response.json()
+                return data["data"][0]["embedding"]
+            else:
+                print(f"❌ Error OpenAI: {response.status_code}")
+                return None
                 
-                # Cargar mapeos
-                with open(docs_file, "r") as f:
-                    data = json.load(f)
-                    self.documents = data.get("documents", {})
-                    self.chunk_to_doc = {int(k): v for k, v in data.get("chunk_to_doc", {}).items()}
+        except Exception as e:
+            print(f"❌ Error embedding: {e}")
+            return None
+
+    def get_batch_embeddings(self, texts: list) -> list:
+        """Batch embeddings optimizado"""
+        try:
+            batch_size = 100  # text-embedding-3-large permite batches más grandes
+            all_embeddings = []
+            
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                
+                url = "https://api.openai.com/v1/embeddings"
+                headers = {
+                    "Authorization": f"Bearer {self.openai_api_key}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": "text-embedding-3-large",
+                    "input": batch
+                }
+                
+                response = requests.post(url, headers=headers, json=payload, timeout=30)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    batch_embeddings = [item["embedding"] for item in data["data"]]
+                    all_embeddings.extend(batch_embeddings)
+                    print(f"✅ Batch {i//batch_size + 1} procesado ({len(batch)} chunks)")
+                else:
+                    print(f"❌ Error batch: {response.status_code}")
+                    return None
+            
+            return all_embeddings
+            
+        except Exception as e:
+            print(f"❌ Error batch embeddings: {e}")
+            return None
+
+    def search_similar(self, query: str, k: int = 3) -> list:
+        """Búsqueda semántica mejorada"""
+        if not self.chunks or not self.embeddings:
+            return []
+        
+        try:
+            print(f"🔍 Búsqueda semántica: '{query}' en {len(self.chunks)} chunks")
+            
+            # Query embedding con modelo large
+            query_embedding = self.get_embedding(query)
+            if not query_embedding:
+                return []
+            
+            # Calcular similitudes
+            similarities = []
+            for chunk_embedding in self.embeddings:
+                similarity = self.cosine_similarity_simple(query_embedding, chunk_embedding)
+                similarities.append(similarity)
+            
+            # Top resultados
+            top_indices = np.argsort(similarities)[::-1][:k * 2]
+            
+            print(f"🎯 Resultados semánticos:")
+            similar_chunks = []
+            
+            for i, idx in enumerate(top_indices[:8]):
+                similarity = similarities[idx]
+                chunk_preview = self.chunks[idx][:200] + "..." if len(self.chunks[idx]) > 200 else self.chunks[idx]
+                print(f"   #{i+1}: {similarity:.3f} - {chunk_preview}")
+                
+                # Umbral más bajo para text-embedding-3-large (es más preciso)
+                if similarity > 0.15 and len(similar_chunks) < k:
+                    similar_chunks.append(self.chunks[idx])
+            
+            # Garantizar al menos 1 resultado si hay chunks
+            if len(similar_chunks) == 0 and len(top_indices) > 0:
+                similar_chunks.append(self.chunks[top_indices[0]])
+                print("   ⚠️ Forzando mejor resultado disponible")
+            
+            print(f"✅ {len(similar_chunks)} chunks seleccionados")
+            return similar_chunks
+            
+        except Exception as e:
+            print(f"❌ Error búsqueda: {e}")
+            return []
+
+    def cosine_similarity_simple(self, vec1: list, vec2: list) -> float:
+        """Similitud coseno optimizada"""
+        try:
+            a = np.array(vec1, dtype=np.float32)
+            b = np.array(vec2, dtype=np.float32)
+            
+            dot_product = np.dot(a, b)
+            norm_product = np.linalg.norm(a) * np.linalg.norm(b)
+            
+            if norm_product == 0:
+                return 0.0
+            
+            return float(np.clip(dot_product / norm_product, -1.0, 1.0))
+            
+        except Exception as e:
+            return 0.0
+
+    # USAR el chunking universal en create_vector_database
+    def create_vector_database(self, pdf_folder: str):
+        """Crear BD con Document Intelligence + embeddings large"""
+        print(f"📚 Procesando PDFs con Document Intelligence...")
+        
+        self.chunks = []
+        self.documents = {}
+        successful_docs = 0
+        failed_docs = []
+        
+        if not os.path.exists(pdf_folder):
+            os.makedirs(pdf_folder, exist_ok=True)
+            return False
+        
+        pdf_files = [f for f in os.listdir(pdf_folder) if f.lower().endswith('.pdf')]
+        
+        if not pdf_files:
+            print("📁 No se encontraron PDFs")
+            return False
+        
+        for filename in pdf_files:
+            pdf_path = os.path.join(pdf_folder, filename)
+            
+            try:
+                # Document Intelligence extrae con estructura semántica
+                text = self.extract_text_from_pdf(pdf_path)
+                
+                if not text or len(text.strip()) < 50:
+                    failed_docs.append(filename)
+                    continue
+                
+                # Chunking universal sin reglas hardcodeadas
+                chunks = self.split_text_semantic_universal(text)
+                
+                if not chunks:
+                    failed_docs.append(filename)
+                    continue
+                
+                # Agregar chunks con metadatos
+                for chunk in chunks:
+                    enhanced_chunk = f"[{filename}] {chunk}"
+                    self.chunks.append(enhanced_chunk)
+                
+                self.documents[filename] = len(chunks)
+                successful_docs += 1
+                print(f"✅ {filename}: {len(chunks)} chunks")
+                
+            except Exception as e:
+                print(f"❌ Error {filename}: {e}")
+                failed_docs.append(filename)
+        
+        if not self.chunks:
+            print("❌ No se procesaron PDFs")
+            return False
+        
+        # Embeddings con text-embedding-3-large
+        print(f"\n🧠 Creando embeddings 3-large para {len(self.chunks)} chunks...")
+        self.embeddings = self.get_batch_embeddings(self.chunks)
+        
+        if not self.embeddings:
+            return False
+        
+        self.save_database()
+        
+        print(f"\n✅ BD semántica creada:")
+        print(f"   📁 Documentos: {successful_docs}")
+        print(f"   📝 Chunks: {len(self.chunks)}")
+        if failed_docs:
+            print(f"   ❌ Fallidos: {', '.join(failed_docs[:3])}")
+        
+        return True
+
+    # Mantener métodos de persistencia, stats, etc. igual...
+    def save_database(self):
+        try:
+            os.makedirs("data", exist_ok=True)
+            data = {
+                'chunks': self.chunks,
+                'embeddings': self.embeddings,
+                'documents': self.documents
+            }
+            
+            with open(self.db_file, 'wb') as f:
+                pickle.dump(data, f)
+            
+            print("💾 BD guardada")
+            
+        except Exception as e:
+            print(f"❌ Error guardando: {e}")
+
+    def load_database(self):
+        try:
+            if os.path.exists(self.db_file):
+                with open(self.db_file, 'rb') as f:
+                    data = pickle.load(f)
+                
+                self.chunks = data.get('chunks', [])
+                self.embeddings = data.get('embeddings', [])
+                self.documents = data.get('documents', {})
                 
                 print(f"📚 BD cargada: {len(self.documents)} docs, {len(self.chunks)} chunks")
             else:
-                print("📝 Nueva base de datos creada")
+                print("📚 BD no encontrada")
                 
         except Exception as e:
-            print(f"❌ Error cargando BD: {e}")
+            print(f"❌ Error cargando: {e}")
             self.chunks = []
+            self.embeddings = []
             self.documents = {}
-            self.chunk_to_doc = {}
-    
-    def create_vector_database(self, pdf_folder: str):
-        """Crear BD desde carpeta de PDFs"""
-        if not os.path.exists(pdf_folder):
-            print(f"❌ Carpeta {pdf_folder} no existe")
-            return
-        
-        pdf_files = [f for f in os.listdir(pdf_folder) if f.endswith('.pdf')]
-        
-        for pdf_file in pdf_files:
-            pdf_path = os.path.join(pdf_folder, pdf_file)
-            try:
-                with open(pdf_path, 'rb') as f:
-                    self.add_pdf_from_upload(f.read(), pdf_file)
-            except Exception as e:
-                print(f"❌ Error con {pdf_file}: {e}")
-        
-        print(f"✅ Procesados {len(pdf_files)} PDFs")
+
+    def get_stats(self) -> dict:
+        return {
+            "total_documents": len(self.documents),
+            "total_chunks": len(self.chunks),
+            "documents": self.documents,
+            "status": "active" if self.chunks else "empty"
+        }
+
+    def add_pdf_from_upload(self, file_content: bytes, filename: str) -> bool:
+        try:
+            pdf_folder = "data/pdfs"
+            os.makedirs(pdf_folder, exist_ok=True)
+            
+            pdf_path = os.path.join(pdf_folder, filename)
+            
+            with open(pdf_path, 'wb') as f:
+                f.write(file_content)
+            
+            return self.create_vector_database(pdf_folder)
+            
+        except Exception as e:
+            print(f"❌ Error upload: {e}")
+            return False
+
+    def list_documents(self) -> list:
+        return list(self.documents.keys())
+
+    def remove_document(self, filename: str) -> bool:
+        try:
+            pdf_folder = "data/pdfs"
+            pdf_path = os.path.join(pdf_folder, filename)
+            
+            if os.path.exists(pdf_path):
+                os.remove(pdf_path)
+            
+            self.create_vector_database(pdf_folder)
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error eliminando: {e}")
+            return False

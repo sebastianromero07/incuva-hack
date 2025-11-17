@@ -5,6 +5,8 @@ from auth.jwt_handler import verify_token, create_access_token
 from models.user import user_manager
 from utils.llm import rag
 from datetime import timedelta
+import os      # ✅ AGREGAR ESTA LÍNEA
+import json
 
 router = APIRouter()
 templates = Jinja2Templates(directory="templates")
@@ -23,15 +25,31 @@ def get_current_user(access_token: str = Cookie(None)):
     except:
         raise HTTPException(status_code=302, detail="Redirect to login")
 
-# Configuración del bot
-bot_config = {
-    "status": "inactive",
-    "welcome_message": "👋 ¡Hola soy TOmi! Tu asistente virtual de soporte técnico.\nEstoy aquí para ayudarte con cualquier duda o problema que tengas.\n\nCuéntame qué necesitas y te ayudaré al instante.",
-    "handoff_message": "Un momento, te voy a conectar con un agente humano que podrá ayudarte mejor."
-}
+
 
 def get_bot_config():
-    return bot_config
+    """Cargar configuración desde archivo"""
+    try:
+        with open("data/bot_config.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        # Configuración por defecto si no existe el archivo
+        return {
+            "status": "inactive",
+            "welcome_message": "👋 ¡Hola soy TOmi! Tu asistente virtual de soporte técnico.\nEstoy aquí para ayudarte con cualquier duda o problema que tengas.\n\nCuéntame qué necesitas y te ayudaré al instante.",
+            "handoff_message": "Un momento, te voy a conectar con un agente humano que podrá ayudarte mejor."
+        }
+
+def save_bot_config(config):
+    """Guardar configuración en archivo"""
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open("data/bot_config.json", "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"❌ Error guardando config: {e}")
+        return False
 
 # ===== RUTAS PÚBLICAS =====
 
@@ -103,13 +121,14 @@ async def dashboard(request: Request):
         return templates.TemplateResponse("dashboard.html", {
             "request": request,
             "user": user,
-            "bot_config": bot_config,
-            "pdf_count": stats["pdf_count"],
-            "chunks_count": stats["chunks_count"],
-            "rag_status": stats["rag_status"],
+            "bot_config": get_bot_config(),
+            "pdf_count": stats["total_documents"],   
+            "chunks_count": stats["total_chunks"],  
+            "rag_status": stats["status"] == "active", 
             "pdfs": pdfs
         })
         
+
     except Exception as e:
         print(f"❌ Error en dashboard: {e}")
         return templates.TemplateResponse("dashboard.html", {
@@ -165,7 +184,7 @@ async def delete_pdf(request: Request, filename: str):
         return RedirectResponse(url="/login", status_code=302)
     
     try:
-        success = rag.delete_document(filename)
+        success = rag.remove_document(filename) 
         if success:
             return RedirectResponse(url="/dashboard?success=PDF eliminado", status_code=302)
         else:
@@ -191,11 +210,16 @@ async def update_bot_config(
     except:
         return RedirectResponse(url="/login", status_code=302)
     
-    global bot_config
-    bot_config["welcome_message"] = welcome_message
-    bot_config["handoff_message"] = handoff_message
+    # CORREGIR: Guardar en archivo, no en memoria
+    config = get_bot_config()
+    config["welcome_message"] = welcome_message
+    config["handoff_message"] = handoff_message
     
-    return RedirectResponse(url="/dashboard?success=Configuración actualizada", status_code=302)
+    if save_bot_config(config):
+        return RedirectResponse(url="/dashboard?success=Configuración actualizada", status_code=302)
+    else:
+        return RedirectResponse(url="/dashboard?error=Error guardando configuración", status_code=302)
+
 
 @router.post("/toggle-bot-status")
 async def toggle_bot_status(request: Request):
@@ -210,12 +234,16 @@ async def toggle_bot_status(request: Request):
     except:
         return RedirectResponse(url="/login", status_code=302)
     
-    global bot_config
-    if bot_config["status"] == "active":
-        bot_config["status"] = "inactive"
+    # CORREGIR: Guardar en archivo, no en memoria
+    config = get_bot_config()
+    if config["status"] == "active":
+        config["status"] = "inactive"
         message = "Bot desactivado"
     else:
-        bot_config["status"] = "active"
+        config["status"] = "active"
         message = "Bot activado"
     
-    return RedirectResponse(url=f"/dashboard?success={message}", status_code=302)
+    if save_bot_config(config):
+        return RedirectResponse(url=f"/dashboard?success={message}", status_code=302)
+    else:
+        return RedirectResponse(url="/dashboard?error=Error guardando estado", status_code=302)
