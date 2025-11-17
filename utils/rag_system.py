@@ -28,21 +28,42 @@ class RAGSystem:
         return chunks
     
     def _simple_search(self, query: str, chunks: List[str], k: int = 3) -> List[str]:
-        """Búsqueda simple basada en palabras clave"""
+        """Búsqueda simple basada en palabras clave con mejor scoring"""
         query_words = set(query.lower().split())
         
-        # Calcular puntuaciones por overlap de palabras
+        # Palabras de parada en español
+        stop_words = {"el", "la", "de", "que", "y", "en", "un", "es", "se", "no", "te", "lo", "le", "da", "su", "por", "son", "con", "para", "como", "al", "del", "si", "me", "mi", "tu", "este", "esta", "hay", "pero", "más", "o", "muy", "ya", "todo", "bien", "puede", "ser", "tiene", "hacer", "vez", "dos", "aquí", "cómo", "qué", "dónde", "cuándo"}
+        
+        # Filtrar palabras de parada
+        query_words = query_words - stop_words
+        
+        if not query_words:
+            return []
+        
+        # Calcular puntuaciones mejoradas
         scores = []
         for i, chunk in enumerate(chunks):
-            chunk_words = set(chunk.lower().split())
-            overlap = len(query_words.intersection(chunk_words))
-            score = overlap / max(len(query_words), 1)
-            scores.append((score, i, chunk))
+            chunk_words = set(chunk.lower().split()) - stop_words
+            
+            # Calcular diferentes tipos de coincidencias
+            exact_matches = len(query_words.intersection(chunk_words))
+            partial_matches = sum(1 for qw in query_words for cw in chunk_words if qw in cw or cw in qw)
+            
+            # Puntuación combinada
+            exact_score = exact_matches / max(len(query_words), 1)
+            partial_score = partial_matches / max(len(query_words), 1) * 0.3
+            total_score = exact_score + partial_score
+            
+            if total_score > 0:
+                scores.append((total_score, i, chunk))
         
         # Ordenar por puntuación y devolver top k
         scores.sort(key=lambda x: x[0], reverse=True)
-        return [chunk for score, idx, chunk in scores[:k] if score > 0]
-    
+        
+        # Solo devolver chunks con puntuación mínima
+        min_score = 0.1  # Umbral mínimo de relevancia
+        return [chunk for score, idx, chunk in scores[:k] if score >= min_score]
+        
     def add_pdf_from_upload(self, file_content: bytes, filename: str) -> bool:
         """Agregar PDF desde upload"""
         try:

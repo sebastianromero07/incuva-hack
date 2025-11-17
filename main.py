@@ -26,7 +26,7 @@ def cleanup_old_messages():
     if len(processed_messages) > 1000:
         processed_messages.clear()
 
-# Incluir rutas del dashboard (YA INCLUYE LANDING + PROTECCIÓN)
+# Incluir rutas del dashboard
 app.include_router(dashboard_router)
 
 # Servir archivos estáticos
@@ -57,6 +57,8 @@ async def startup_event():
     else:
         print("⚠️ Webhook no configurado (desarrollo local)")
 
+# ...existing code...
+
 @app.post("/webhook")
 async def webhook(request: Request):
     """Webhook de Telegram - PÚBLICO"""
@@ -80,17 +82,27 @@ async def webhook(request: Request):
             
             # Verificar bot activo
             from dashboard.routes import get_bot_config
+            from utils.llm import is_handoff_request, get_handoff_message
+            
             bot_config = get_bot_config()
             
             if bot_config.get('status') != 'active':
                 print("🔴 Bot inactivo")
                 return {"status": "bot_inactive"}
             
-            # Generar respuesta
-            if user_text.lower() in ["/start", "start", "hola", "hello", "hi"]:
+            # Generar respuesta basada en el tipo de mensaje
+            if user_text.lower() in ["/start", "start", "hola", "hello", "hi", "inicio"]:
+                # Usar mensaje de bienvenida del dashboard
                 bot_reply = get_welcome_message()
-                print("👋 Enviando mensaje de bienvenida")
+                print("👋 Enviando mensaje de bienvenida (desde config)")
+                
+            elif is_handoff_request(user_text):
+                # Transferencia a agente humano
+                bot_reply = get_handoff_message()
+                print("🔄 Enviando mensaje de transferencia (desde config)")
+                
             else:
+                # Generar respuesta estricta basada en PDFs
                 bot_reply = generate_reply(user_text)
             
             # Enviar respuesta
@@ -98,7 +110,8 @@ async def webhook(request: Request):
                 f"{TELEGRAM_API}/sendMessage",
                 json={
                     "chat_id": chat_id,
-                    "text": bot_reply
+                    "text": bot_reply,
+                    "parse_mode": "HTML"  # Para formateo básico
                 },
                 timeout=15
             )
@@ -111,6 +124,7 @@ async def webhook(request: Request):
         print(f"❌ Webhook error: {e}")
         return {"status": "error"}
 
+# ...existing code...
 @app.get("/health")
 async def health():
     """Health check - PÚBLICO"""
@@ -121,7 +135,8 @@ async def health():
             "webhook_url": WEBHOOK_URL,
             "documents": len(rag.list_documents()),
             "chunks": len([c for c in rag.chunks if c.strip()]),
-            "telegram_configured": bool(TELEGRAM_TOKEN)
+            "telegram_configured": bool(TELEGRAM_TOKEN),
+            "bot_mode": "strict_pdf_only"
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
