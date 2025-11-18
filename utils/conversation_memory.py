@@ -86,72 +86,90 @@ class ConversationMemory:
             
         except Exception as e:
             print(f"❌ Error agregando mensaje a memoria: {e}")
-    
+
     def find_relevant_memory(self, chat_id: str, current_query: str, k: int = 5) -> List[str]:
-        """✅ MEJORADO: Buscar mensajes relevantes con mejor algoritmo"""
+        """✅ CORREGIDO: Buscar mensajes relevantes con mejor contexto histórico"""
         try:
             if chat_id not in self.chat_message_history:
-                return []
-            
-            # Crear embedding de la consulta actual
-            query_embedding = self.get_embedding_for_memory(current_query)
-            if not query_embedding:
                 return []
             
             chat_history = self.chat_message_history[chat_id]
             if not chat_history:
                 return []
             
-            # ✅ MEJORADO: Análisis más inteligente
             current_lower = current_query.lower()
             
-            # Buscar por palabras clave específicas primero
-            keyword_matches = []
+            # ✅ MEJORADO: Si pregunta sobre conversación previa, mostrar MÁS contexto
+            if any(keyword in current_lower for keyword in [
+                'pregunte', 'pregunta', 'anterior', 'antes', 'previamente', 'hace poco',
+                'y antes', 'antes de eso', 'pregunta anterior', 'dos preguntas'
+            ]):
+                print("🔍 Consulta de memoria ampliada detectada - mostrando más contexto")
+                
+                # ✅ AUMENTAR: Obtener los últimos 15 mensajes (más contexto)
+                recent_messages = chat_history[-15:]
+                relevant_messages = []
+                
+                # Filtrar preguntas del usuario (más completo)
+                user_questions = []
+                for timestamp, message, embedding in reversed(recent_messages):
+                    if 'usuario:' in message:
+                        # Excluir solo la pregunta ACTUAL
+                        message_clean = message.replace('usuario:', '').strip()
+                        if current_query.lower().strip() not in message_clean.lower():
+                            user_questions.append((timestamp, message))
+                
+                # ✅ MOSTRAR múltiples preguntas anteriores (no solo la más reciente)
+                if user_questions:
+                    for i, (timestamp, message) in enumerate(user_questions[:5]):  # Hasta 5 preguntas
+                        relevant_messages.append(f"[{timestamp[:16]}] {message}")
+                
+                if relevant_messages:
+                    print(f"🔍 Encontradas {len(relevant_messages)} preguntas anteriores")
+                    return relevant_messages
+                
+            # ✅ FALLBACK: Búsqueda semántica normal
+            return self._semantic_search(chat_history, current_query, k)
+            
+        except Exception as e:
+            print(f"❌ Error buscando en memoria: {e}")
+            return []
+
+    def _semantic_search(self, chat_history: List[Tuple], current_query: str, k: int) -> List[str]:
+        """✅ AGREGADO: Búsqueda semántica normal"""
+        try:
+            query_embedding = self.get_embedding_for_memory(current_query)
+            if not query_embedding:
+                return []
+            
+            # Búsqueda semántica normal para otros casos
             semantic_matches = []
             
             for i, (timestamp, message, embedding) in enumerate(chat_history):
-                message_lower = message.lower()
-                
-                # 1. Búsqueda por palabras clave específicas
-                if any(keyword in current_lower for keyword in ['pregunte', 'pregunta', 'anterior', 'antes']):
-                    # Si pregunta sobre conversación previa, buscar preguntas del usuario
-                    if 'usuario:' in message and any(word in message_lower for word in [
-                        'convalidación', 'intercambio', 'países', 'cursos', 'extranjero', 
-                        'universidad', 'trámite', 'procedimiento', 'costo'
-                    ]):
-                        keyword_matches.append((0.9, message, timestamp, i))
-                
-                # 2. Búsqueda semántica normal
-                similarity = self.cosine_similarity(query_embedding, embedding)
-                if similarity > 0.3:
-                    semantic_matches.append((similarity, message, timestamp, i))
+                if embedding:  # Solo si tiene embedding
+                    similarity = self.cosine_similarity(query_embedding, embedding)
+                    if similarity > 0.3:
+                        semantic_matches.append((similarity, message, timestamp, i))
             
-            # Combinar resultados priorizando palabras clave
-            all_matches = keyword_matches + semantic_matches
+            # Ordenar por similitud
+            semantic_matches.sort(key=lambda x: x[0], reverse=True)
             
-            # Ordenar por relevancia (keywords primero, luego similitud)
-            all_matches.sort(key=lambda x: x[0], reverse=True)
-            
-            # Remover duplicados y tomar los mejores
-            seen_indices = set()
+            # Tomar los mejores
             relevant_messages = []
-            
-            for similarity, message, timestamp, idx in all_matches:
-                if idx not in seen_indices and len(relevant_messages) < k:
-                    relevant_messages.append(f"[{timestamp[:16]}] {message}")
-                    seen_indices.add(idx)
+            for similarity, message, timestamp, idx in semantic_matches[:k]:
+                relevant_messages.append(f"[{timestamp[:16]}] {message}")
             
             if relevant_messages:
-                print(f"🔍 Encontrados {len(relevant_messages)} mensajes relevantes en memoria")
-                for msg in relevant_messages[:3]:  # Mostrar solo los primeros 3
+                print(f"🔍 Encontrados {len(relevant_messages)} mensajes semánticamente relevantes")
+                for msg in relevant_messages[:3]:
                     print(f"   📝 {msg[:100]}...")
             
             return relevant_messages
             
         except Exception as e:
-            print(f"❌ Error buscando en memoria: {e}")
+            print(f"❌ Error en búsqueda semántica: {e}")
             return []
-    
+            
     def cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
         """Calcular similitud coseno"""
         try:
@@ -277,7 +295,6 @@ class ConversationMemory:
         except Exception as e:
             return ""
     
-    # ✅ MANTENER todos los métodos existentes...
     def clear_chat_context(self, chat_id: str):
         """Limpiar contexto completo de un chat"""
         if chat_id in self.chat_response_ids:

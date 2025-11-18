@@ -1,142 +1,124 @@
 import os
 import requests
 import hashlib
-from functools import lru_cache
 from .rag_system import RAGSystemOpenAI
 from .conversation_memory import conversation_memory
-import re
+from .message_handlers import (
+    is_greeting, is_user_correction_or_clarification, is_handoff_request,
+    is_general_info_request, is_conversation_memory_query, should_use_conversation_context
+)
+from .response_message import (
+    get_welcome_message, get_correction_response, get_handoff_message,
+    get_general_info_response
+)
 
 # Inicializar RAG globalmente
 rag = RAGSystemOpenAI()
 rag.load_database()
 
-# Cache OPTIMIZADO para respuestas frecuentes
+# Cache OPTIMIZADO
 response_cache = {}
 
 def get_cache_key(user_text: str, chunks: list) -> str:
-    """Crear clave de cache OPTIMIZADA"""
+    """Crear clave de cache"""
     chunks_text = "".join(chunks[:1]) if chunks else ""
     content = f"{user_text[:80]}:{chunks_text[:150]}"
     return hashlib.md5(content.encode()).hexdigest()
 
-@lru_cache(maxsize=100)
-def get_welcome_message() -> str:
-    """Obtener mensaje de bienvenida (CACHED)"""
-    try:
-        from dashboard.routes import get_bot_config
-        bot_config = get_bot_config()
-        return bot_config.get("welcome_message", get_default_welcome_message())
-    except Exception as e:
-        return get_default_welcome_message()
-
-def get_default_welcome_message() -> str:
-    return """👋 ¡Hola! Soy TOmi, tu asistente virtual de soporte técnico.
-
-Estoy aquí para ayudarte con información específica de nuestra documentación técnica. 
-
-¿En qué puedo ayudarte hoy?"""
-
-@lru_cache(maxsize=100)
-def get_handoff_message() -> str:
-    """Obtener mensaje de transferencia (CACHED)"""
-    try:
-        from dashboard.routes import get_bot_config
-        bot_config = get_bot_config()
-        return bot_config.get("handoff_message", """🔄 Te voy a transferir con un agente humano que podrá ayudarte mejor.
-
-Un momento por favor...""")
-    except Exception:
-        return "🔄 Transfiriendo a agente humano..."
-
-def is_handoff_request(user_text: str) -> bool:
-    """Detectar solicitud de agente humano (SÚPER OPTIMIZADO)"""
-    user_lower = user_text.lower()
-    
-    # Solo palabras más comunes para salida temprana
-    if any(word in user_lower for word in ["agente", "persona", "humano", "transferir"]):
-        return True
-    
-    return False
-
-def is_greeting(user_text: str) -> bool:
-    """Detectar si es un saludo simple"""
-    user_lower = user_text.lower().strip()
-    greetings = ["hola", "hello", "hi", "buenas", "saludos", "hey"]
-    
-    # Solo saludos MUY simples (1 palabra)
-    if len(user_text.split()) == 1 and any(greeting in user_lower for greeting in greetings):
-        return True
-    
-    return False
-
 def generate_reply(user_text: str, chat_id: str) -> str:
-    """Genera respuesta INTELIGENTE CON EXTRACCIÓN DE INFORMACIÓN"""
+    """✅ IA INTELIGENTE que distingue entre consultas de memoria vs. base de datos"""
     
     print(f"⚡ Procesando: '{user_text[:25]}...' [Chat: {chat_id}]")
     
-    # ✅ NUEVO: Agregar mensaje del usuario a la memoria vectorial INMEDIATAMENTE
+    # Agregar mensaje a memoria
     conversation_memory.add_message_to_memory(chat_id, user_text, is_user=True)
     
-    # 1. PRIORIDAD: Solo saludos de UNA palabra
+    # 1. PRIORIDAD MÁXIMA: Correcciones del usuario
+    if is_user_correction_or_clarification(user_text):
+        print("🔄 Corrección del usuario detectada")
+        return get_correction_response()
+    
+    # 2. PRIORIDAD: Saludos
     if is_greeting(user_text):
-        print("👋 Saludo simple detectado - respuesta rápida")
+        print("👋 Saludo detectado - mensaje del dashboard")
         return get_welcome_message()
     
-    # 2. PRIORIDAD: Verificar solicitud de agente humano (RÁPIDO)
+    # 3. PRIORIDAD: Transferencia a agente humano
     if is_handoff_request(user_text):
         print("🔄 Transferencia detectada")
         conversation_memory.clear_chat_context(chat_id)
         return get_handoff_message()
     
-    # ✅ MODIFICADO: Validación más inteligente - Solo rechazar temas CLARAMENTE externos
-    if is_clearly_out_of_scope(user_text):
-        print("⚠️ Consulta claramente fuera de alcance detectada")
-        return get_out_of_scope_message()
+    # 4. Consulta general de información
+    if is_general_info_request(user_text):
+        print("📋 Consulta general de información detectada")
+        documents = rag.list_documents()
+        return get_general_info_response(documents)
     
-    # 3. Verificar documentos cargados (RÁPIDO)
+    # ✅ 5. NUEVO: Consulta sobre memoria de conversación
+    if is_conversation_memory_query(user_text):
+        print("🧠 Consulta sobre memoria de conversación detectada")
+        return handle_conversation_memory_query(user_text, chat_id)
+    
+    # 6. Verificar documentos cargados
     if not rag.chunks:
-        return """❌ Lo siento, actualmente no tengo información técnica cargada en mi sistema.
+        return """❌ Lo siento, actualmente no tengo información cargada.
 
-Por favor, contacta con el administrador para que agregue los documentos necesarios."""
+Contacta al administrador para que agregue los documentos necesarios."""
     
-    # 4. Buscar información SÚPER OPTIMIZADA
-    similar_chunks = rag.search_similar(user_text, k=3)  # ✅ AUMENTADO a 3 para más contexto
+    # ✅ 7. BÚSQUEDA INTELIGENTE - Determinar si usar contexto
+    similar_chunks = rag.search_similar(user_text, k=5)
     
-    # ✅ MODIFICADO: Validación más permisiva - Si encuentra chunks relevantes, continuar
-    if not similar_chunks or not has_minimum_relevance(user_text, similar_chunks):
-        print("⚠️ No se encontró información relevante en la documentación")
-        return f"""❌ No encontré información específica sobre "{user_text}" en la documentación disponible.
-
-📚 **Tengo información sobre:**
-{', '.join(rag.list_documents())}
-
-¿Hay algo específico de estos documentos en lo que pueda ayudarte?"""
+    # Determinar si debe usar contexto de conversación
+    use_context = should_use_conversation_context(user_text)
+    has_memory = conversation_memory.should_use_context(chat_id, user_text) if use_context else False
     
-    # 5. VERIFICAR CACHE SÚPER RÁPIDO (pero considerando memoria)
+    # 8. Verificar cache
     cache_key = get_cache_key(user_text, similar_chunks)
     
-    # ✅ MODIFICADO: Solo usar cache si NO hay memoria relevante
-    has_memory = conversation_memory.should_use_context(chat_id, user_text)
     if cache_key in response_cache and not has_memory:
-        print("⚡ CACHE HIT - RESPUESTA INSTANTÁNEA")
+        print("⚡ CACHE HIT")
         return response_cache[cache_key]
     
-    # 6. ✅ MEJORADO: Determinar contexto con memoria vectorial
-    use_context = has_memory
-    conversation_context = ""
+    # ✅ 9. GENERAR RESPUESTA INTELIGENTE
+    return generate_intelligent_response(user_text, chat_id, similar_chunks, has_memory, use_context)
+
+
+def handle_conversation_memory_query(user_text: str, chat_id: str) -> str:
+    """✅ COMPLETADO: Manejar consultas con mejor contexto histórico"""
     
-    if use_context:
-        # Obtener contexto de conversación previa
-        conversation_context = conversation_memory.get_conversation_context(chat_id, user_text)
-        print(f"🧠 Usando contexto de memoria vectorial")
+    if chat_id in conversation_memory.chat_message_history:
+        # ✅ AUMENTAR: Obtener más mensajes para mejor contexto
+        recent_messages = conversation_memory.chat_message_history[chat_id][-12:]
+        
+        if recent_messages:
+            # ✅ MEJORAR: Detectar qué nivel de "antes" pregunta
+            user_lower = user_text.lower()
+            
+            user_questions = []
+            for timestamp, message, _ in reversed(recent_messages):
+                if 'usuario:' in message:
+                    message_clean = message.replace('usuario:', '').strip()
+                    if user_text.lower().strip() not in message_clean.lower():
+                        user_questions.append(f"[{timestamp[:16]}] {message_clean}")
+                        if len(user_questions) >= 5:  # Hasta 5 preguntas anteriores
+                            break
+            
+            if user_questions:
+                conversation_context = f"PREGUNTAS ANTERIORES DEL USUARIO (más reciente primero):\n"
+                for i, question in enumerate(user_questions):
+                    conversation_context += f"{i+1}. {question}\n"
+            else:
+                return "🤔 No encuentro preguntas anteriores recientes."
+        else:
+            return "🤔 No hay mensajes anteriores en la conversación."
     else:
-        print("🆕 Nueva consulta independiente - sin contexto")
+        return "🤔 No hay historial de conversación."
     
-    # 7. Configurar OpenAI oficial
+    # ✅ COMPLETAR: Configurar OpenAI para consulta de memoria
     openai_api_key = os.getenv("OPENAI_API_KEY")
-    
     if not openai_api_key:
-        return "❌ Error de configuración de OpenAI. Contacta al administrador."
+        return "❌ Error de configuración. Contacta al administrador."
     
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
@@ -144,91 +126,158 @@ Por favor, contacta con el administrador para que agregue los documentos necesar
         "Content-Type": "application/json"
     }
     
-    # 8. ✅ MEJORADO: Contexto más rico con múltiples chunks
-    document_context = ""
-    if similar_chunks:
-        document_context = "INFORMACIÓN ENCONTRADA EN DOCUMENTOS:\n\n"
-        for i, chunk in enumerate(similar_chunks[:3]):
-            document_context += f"**Fuente {i+1}:** {chunk}\n\n"
-    
-    documents = rag.list_documents()
-    
-    # 9. ✅ COMPLETAMENTE REDISEÑADO: Sistema prompt INTELIGENTE Y ÚTIL
-    system_prompt = f"""Eres TOmi, asistente técnico especializado e INTELIGENTE.
+    # ✅ PROMPT ESPECÍFICO PARA MEMORIA DE CONVERSACIÓN RECIENTE
+    system_prompt = f"""Eres TOmi, asistente especializado. El usuario te está preguntando sobre SUS PREGUNTAS ANTERIORES en la conversación reciente.
 
-INSTRUCCIONES PRINCIPALES:
-- Tu trabajo es SER ÚTIL y EXTRAER información relevante de los documentos
-- Si encuentras información relacionada con la consulta, PRESÉNTALA de manera clara y organizada
-- ANALIZA la información disponible y responde de la manera más útil posible
-- Si hay listas, países, universidades, procedimientos, etc. - COMPÁRTELOS completamente
-- Usa la memoria de conversación para dar respuestas contextualizadas
-- Sé profesional pero ÚTIL y COMPLETO en tus respuestas
-- Organiza la información con viñetas, números, o formato claro
-- Si no tienes información específica, dilo claramente y sugiere alternativas
-
-DOCUMENTOS DISPONIBLES: {', '.join(documents) if documents else 'Ninguno'}
-
+CONTEXTO DE CONVERSACIÓN RECIENTE:
 {conversation_context}
 
-Tu objetivo es ser el asistente MÁS ÚTIL posible usando la información disponible."""
-    
-    # 10. ✅ MEJORADO: Mensaje optimizado para extracción de información
-    if conversation_context:
-        current_message = f"""CONSULTA DEL USUARIO: {user_text}
-
-{document_context}
-
 INSTRUCCIONES ESPECÍFICAS:
-- Extrae y presenta TODA la información relevante que encuentres
-- Si hay listas (universidades, países, procedimientos), muéstralas COMPLETAS
-- Organiza la información de manera clara y útil
-- Usa la conversación previa para dar mejor contexto"""
-    else:
-        current_message = f"""CONSULTA: {user_text}
+1. **NO repitas la pregunta del usuario en tu respuesta**
+2. **Sé conciso y directo**
+3. **Si pregunta "qué pregunté hace un momento" → menciona la pregunta #1 (más reciente)**
+4. **Si pregunta "hace dos preguntas" → menciona la pregunta #2**
+5. **Si pregunta "hace dos conversaciones" → menciona la pregunta #3**
+6. **Responde solo sobre las preguntas que aparecen en el contexto reciente**
+7. **Si no encuentra preguntas suficientes, dilo claramente**
 
-{document_context}
-
-INSTRUCCIONES:
-- Analiza la información disponible y presenta TODO lo relevante
-- Si hay listas, procedimientos, requisitos, etc. - compártelos de manera organizada
-- Sé completo y útil en tu respuesta"""
+El usuario quiere saber sobre sus preguntas ANTERIORES específicas."""
     
-    # 11. ✅ MEJORADO: Payload optimizado para respuestas más completas
+    current_message = f"""El usuario pregunta: "{user_text}"
+
+Analiza las preguntas anteriores del contexto y responde de manera concisa sobre cuál fue su pregunta específica según lo que solicita."""
+    
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": current_message}
         ],
-        "temperature": 0.3,  # ✅ Aumentado para más creatividad en presentación
-        "max_tokens": 600,   # ✅ AUMENTADO significativamente para respuestas completas
-        "top_p": 0.9         # ✅ Aumentado para más flexibilidad
+        "temperature": 0.2,  # ✅ Muy baja para precisión
+        "max_tokens": 200,   # ✅ Respuesta muy concisa
+        "top_p": 0.9
     }
     
-    # ... resto del código igual hasta la respuesta ...
-    
+    # ✅ COMPLETAR: Llamada a OpenAI
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=15)  # ✅ Timeout aumentado
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
         
         if response.status_code == 200:
             data = response.json()
             if "choices" in data and len(data["choices"]) > 0:
                 reply = data["choices"][0]["message"]["content"].strip()
                 
-                # ✅ NUEVO: Agregar respuesta del bot a la memoria vectorial
+                # Agregar respuesta a memoria
                 conversation_memory.add_message_to_memory(chat_id, reply, is_user=False)
                 
-                # 14. Guardar response_id para contexto futuro
+                print(f"✅ Consulta de memoria reciente respondida: {len(reply)} chars")
+                return reply
+        else:
+            print(f"❌ Error OpenAI: {response.status_code}")
+            return "❌ No pude procesar tu consulta sobre la conversación anterior."
+        
+    except Exception as e:
+        print(f"❌ Error en consulta de memoria: {e}")
+        return "❌ Error procesando tu consulta sobre la conversación."
+
+def generate_intelligent_response(user_text: str, chat_id: str, similar_chunks: list, has_memory: bool, use_context: bool) -> str:
+    """✅ IA INTELIGENTE que evalúa relevancia y decide respuesta"""
+    
+    # Contexto de memoria
+    conversation_context = ""
+    if has_memory and use_context:
+        conversation_context = conversation_memory.get_conversation_context(chat_id, user_text)
+        print(f"🧠 Usando contexto de memoria vectorial")
+    else:
+        print("🆕 Nueva consulta independiente")
+    
+    # Configurar OpenAI
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        return "❌ Error de configuración. Contacta al administrador."
+    
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {openai_api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    # Contexto de documentos
+    document_context = ""
+    if similar_chunks:
+        document_context = "INFORMACIÓN ENCONTRADA EN BASE DE DATOS:\n\n"
+        for i, chunk in enumerate(similar_chunks[:5]):
+            document_context += f"**Fuente {i+1}:** {chunk}\n\n"
+    
+    documents = rag.list_documents()
+    available_docs = ', '.join(documents) if documents else 'Ninguno'
+    
+    # ✅ SISTEMA PROMPT MEJORADO - NO REPETIR PREGUNTAS
+    system_prompt = f"""Eres TOmi, asistente especializado en procedimientos académicos universitarios.
+
+REGLAS IMPORTANTES:
+1. **NO repitas la pregunta del usuario en tu respuesta**
+2. **Sé conciso y directo - ve al grano**
+3. **Si encuentras información relevante, preséntala de manera clara y organizada**
+4. **Si no hay información relevante, explica brevemente que no tienes esa información específica**
+5. **Para temas externos (matemáticas, etc.), explica educadamente tu especialización**
+6. **Evalúa inteligentemente cada consulta**
+
+DOCUMENTOS DISPONIBLES: {available_docs}
+
+{conversation_context}
+
+Tu objetivo: Respuestas útiles, concisas y directas."""
+    
+    # Mensaje para OpenAI
+    if conversation_context:
+        current_message = f"""Consulta: "{user_text}"
+
+{document_context}
+
+Responde de manera concisa y directa. No repitas la pregunta. Considera el contexto de la conversación."""
+    else:
+        current_message = f"""Consulta: "{user_text}"
+
+{document_context}
+
+Evalúa la relevancia y responde de manera concisa y directa. No repitas la pregunta."""
+    
+    # Payload
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": current_message}
+        ],
+        "temperature": 0.3,  # ✅ Más precisión, menos creatividad
+        "max_tokens": 400,   # ✅ Respuestas concisas
+        "top_p": 0.9
+    }
+    
+    # Llamada a OpenAI
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=20)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if "choices" in data and len(data["choices"]) > 0:
+                reply = data["choices"][0]["message"]["content"].strip()
+                
+                # Agregar respuesta a memoria
+                conversation_memory.add_message_to_memory(chat_id, reply, is_user=False)
+                
+                # Guardar response_id
                 response_id = data.get("id")
                 if response_id:
                     conversation_memory.set_response_id(chat_id, response_id, user_text)
-                    print(f"💭 Response ID actualizado para chat {chat_id}: {response_id[:15]}...")
+                    print(f"💭 Response ID: {response_id[:15]}...")
                 
-                print(f"✅ OpenAI: {len(reply)} chars")
+                print(f"✅ IA Inteligente: {len(reply)} chars")
                 
-                # 15. ✅ MEJORADO: Cache INTELIGENTE (solo para consultas sin memoria)
+                # Cache
                 if not has_memory:
-                    response_cache[cache_key] = reply
+                    response_cache[get_cache_key(user_text, similar_chunks)] = reply
                     if len(response_cache) > 30:
                         items = list(response_cache.items())
                         response_cache.clear()
@@ -243,20 +292,20 @@ INSTRUCCIONES:
         print(f"❌ Error: {e}")
         return "Error de conectividad. Por favor, inténtalo nuevamente."
 
-
+# Funciones de utilidad existentes
 def clear_chat_memory(chat_id: str):
-    """Limpiar memoria COMPLETA de un chat específico"""
+    """Limpiar memoria de un chat"""
     conversation_memory.clear_chat_context(chat_id)
     global response_cache
     response_cache.clear()
-    print(f"🗑️ Memoria completa y cache limpiados para chat {chat_id}")
+    print(f"🗑️ Memoria limpiada para chat {chat_id}")
 
 def get_memory_stats(chat_id: str):
-    """✅ NUEVO: Obtener estadísticas de memoria para un chat"""
+    """Obtener estadísticas de memoria"""
     return conversation_memory.get_memory_stats(chat_id)
 
 def setup_rag(pdf_folder: str = "data/pdfs"):
-    """Función para configurar RAG"""
+    """Configurar RAG"""
     global rag
     if os.path.exists(pdf_folder) and os.listdir(pdf_folder):
         rag.create_vector_database(pdf_folder)
@@ -264,190 +313,4 @@ def setup_rag(pdf_folder: str = "data/pdfs"):
     else:
         print(f"⚠️ No se encontraron PDFs en {pdf_folder}")
 
-# ✅ NUEVO: Función para debug de memoria
-def debug_chat_memory(chat_id: str):
-    """Debug de memoria para un chat específico"""
-    stats = get_memory_stats(chat_id)
-    print(f"🔍 Debug memoria chat {chat_id}:")
-    print(f"   📝 Mensajes en memoria: {stats['message_count']}")
-    print(f"   🆔 Tiene response_id: {stats['has_response_id']}")
-    print(f"   📋 Tiene topic: {stats['has_topic']}")
-    
-    # Mostrar últimos mensajes si existen
-    if chat_id in conversation_memory.chat_message_history:
-        recent_messages = conversation_memory.chat_message_history[chat_id][-3:]
-        print(f"   📚 Últimos mensajes:")
-        for timestamp, message, _ in recent_messages:
-            preview = message[:80] + "..." if len(message) > 80 else message
-            print(f"     • {timestamp[:16]} - {preview}")
-
-def is_out_of_scope(user_text: str) -> bool:
-    """Detectar consultas fuera del alcance ANTES de procesar"""
-    user_lower = user_text.lower().strip()
-    
-    # Palabras clave que indican consultas fuera de alcance
-    out_of_scope_indicators = [
-        # Matemáticas y ciencias
-        "matemática", "matemáticas", "ecuación", "fórmula", "calcular", "resolver",
-        "física", "química", "biología", "estadística", "álgebra", "geometría",
-        
-        # Programación y tecnología
-        "programar", "código", "python", "javascript", "html", "css", "sql",
-        "algoritmo", "programación", "software", "aplicación", "app",
-        
-        # Consultas generales
-        "receta", "cocinar", "tiempo", "clima", "noticias", "chiste", "juego",
-        "película", "música", "deporte", "fútbol", "entretenimiento",
-        
-        # Salud y consejos personales
-        "enfermo", "dolor", "medicina", "doctor", "síntoma", "tratamiento",
-        "dieta", "ejercicio", "consejo personal", "relación", "amor",
-        
-        # Otras áreas
-        "legal", "abogado", "derecho", "inversión", "dinero", "negocio",
-        "viaje", "turismo", "hotel", "restaurant"
-    ]
-    
-    # Si contiene indicadores de fuera de alcance
-    for indicator in out_of_scope_indicators:
-        if indicator in user_lower:
-            return True
-    
-    # Patrones específicos
-    math_patterns = [
-        r'\b\d+\s*[\+\-\*\/]\s*\d+',  # Operaciones matemáticas
-        r'x\s*=',  # Ecuaciones
-        r'f\(x\)',  # Funciones
-        r'derivada|integral',
-        r'problema.*matemática'
-    ]
-    
-    for pattern in math_patterns:
-        if re.search(pattern, user_lower):
-            return True
-    
-    return False
-
-def is_clearly_out_of_scope(user_text: str) -> bool:
-    """Detectar SOLO consultas CLARAMENTE fuera del alcance"""
-    user_lower = user_text.lower().strip()
-    
-    # Solo rechazar temas CLARAMENTE externos que NO tienen relación con educación/universidad
-    clearly_external = [
-        # Matemáticas específicas (pero no procedimientos académicos)
-        "ecuación", "fórmula", "calcular", "resolver", "derivada", "integral",
-        
-        # Programación específica
-        "código", "python", "javascript", "html", "css", "sql", "algoritmo",
-        
-        # Entretenimiento
-        "chiste", "juego", "película", "música", "deporte", "fútbol",
-        
-        # Salud personal
-        "enfermo", "dolor", "síntoma", "tratamiento",
-        
-        # Cocina y recetas
-        "receta", "cocinar", "ingrediente",
-        
-        # Clima y noticias
-        "tiempo", "clima", "noticias", "temperatura"
-    ]
-    
-    # Palabras académicas que SÍ son relevantes (no rechazar)
-    academic_terms = [
-        "universidad", "intercambio", "convalidación", "trámite", "procedimiento",
-        "estudiante", "asignatura", "curso", "matrícula", "certificado",
-        "documentación", "requisito", "país", "países", "lista", "carrera",
-        "programa", "académico", "pregrado", "postgrado", "silabo"
-    ]
-    
-    # Si contiene términos académicos, NO rechazar
-    for term in academic_terms:
-        if term in user_lower:
-            return False
-    
-    # Solo rechazar si contiene términos claramente externos
-    for term in clearly_external:
-        if term in user_lower:
-            return True
-    
-    # Patrones matemáticos específicos
-    math_patterns = [
-        r'\b\d+\s*[\+\-\*\/]\s*\d+',  # Operaciones matemáticas
-        r'x\s*=',  # Ecuaciones
-        r'f\(x\)',  # Funciones
-    ]
-    
-    for pattern in math_patterns:
-        if re.search(pattern, user_lower):
-            return True
-    
-    return False
-
-
-def has_minimum_relevance(user_text: str, chunks: list) -> bool:
-    """Validar si hay relevancia mínima - MÁS PERMISIVO"""
-    if not chunks:
-        return False
-    
-    # Si el sistema RAG encontró chunks con similitud decente, confiar en él
-    # (El sistema ya filtró por similitud > 0.15)
-    return True  # ✅ Ser más permisivo y confiar en el sistema RAG
-
-
-def is_query_relevant_to_chunks(user_text: str, chunks: list) -> bool:
-    """Validar si la consulta está relacionada con los chunks encontrados"""
-    if not chunks:
-        return False
-    
-    user_lower = user_text.lower()
-    
-    # Palabras clave académicas que SÍ son relevantes
-    academic_keywords = [
-        "convalidación", "trámite", "procedimiento", "universidad", "estudiante",
-        "asignatura", "curso", "matrícula", "certificado", "intercambio",
-        "documentación", "requisito", "costo", "tarifa", "plazo", "entrega",
-        "solicitud", "pago", "académico", "pregrado", "silabo"
-    ]
-    
-    # Si la consulta contiene palabras académicas, es relevante
-    for keyword in academic_keywords:
-        if keyword in user_lower:
-            return True
-    
-    # Verificar si los chunks contienen información académica relevante
-    chunks_text = " ".join(chunks[:2]).lower()  # Solo los primeros 2 chunks
-    
-    # Si los chunks contienen palabras académicas y la similitud es razonable, es relevante
-    chunk_academic_score = sum(1 for keyword in academic_keywords if keyword in chunks_text)
-    
-    # Si hay al menos 2 palabras académicas en los chunks, considerar relevante
-    return chunk_academic_score >= 2
-
-@lru_cache(maxsize=1)
-def get_out_of_scope_message() -> str:
-    """Mensaje para consultas CLARAMENTE fuera de alcance"""
-    try:
-        documents = rag.list_documents()
-        
-        base_message = """❌ Lo siento, esa consulta está fuera de mi área de especialización en procedimientos académicos y administrativos universitarios.
-
-No puedo ayudarte con matemáticas avanzadas, programación, entretenimiento, salud personal, cocina o temas no relacionados con la universidad."""
-        
-        if documents:
-            docs_list = "\n".join([f"• {doc}" for doc in documents[:5]])
-            base_message += f"""
-
-📚 **Mi especialización incluye información sobre:**
-{docs_list}
-
-¿Hay algo específico de estos temas en lo que pueda ayudarte?"""
-        
-        return base_message
-        
-    except Exception:
-        return """❌ Lo siento, esa consulta está fuera de mi especialización en temas académicos y administrativos universitarios.
-
-¿Hay algo relacionado con procedimientos universitarios en lo que pueda ayudarte?"""
-
-print("⚡ Sistema RAG SÚPER OPTIMIZADO - OpenAI + Memoria Vectorial Completa + Cache")
+print("⚡ IA INTELIGENTE - Distingue Memoria vs Base de Datos")
